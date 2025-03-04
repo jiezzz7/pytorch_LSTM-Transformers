@@ -332,6 +332,9 @@ def main():
     plt.figure(figsize=(5, 5), dpi=100)
     sns.regplot(x=val_true.numpy(), y=val_pred.numpy(), scatter=True, marker="*", color='orange',
                 line_kws={'color': 'red'})
+    plt.title('Validation Prediction')
+    plt.xlabel('True values')
+    plt.ylabel('Predicted values')
     plt.savefig(images_dir / 'validation_regression.png')
     plt.show()
 
@@ -358,6 +361,9 @@ def main():
     plt.figure(figsize=(5, 5), dpi=100)
     sns.regplot(x=test_true.numpy(), y=test_pred.numpy(), scatter=True, marker="*", color='orange',
                 line_kws={'color': 'red'})
+    plt.title('Test Prediction')
+    plt.xlabel('True values')
+    plt.ylabel('Predicted values')
     plt.savefig(images_dir / 'test_regression.png')
     plt.show()
 
