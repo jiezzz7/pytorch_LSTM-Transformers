@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, TensorDataset, Subset
 from torchinfo import summary
+import random
 from torchmetrics.functional.regression import mean_absolute_error
 from torchmetrics.functional.regression import mean_absolute_percentage_error
 from torchmetrics.functional.regression import mean_squared_error
@@ -26,11 +27,64 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 # 定义地质条件分类规则的常量
-VP_THRESHOLD = 3500  # P波速度阈值
-VS_THRESHOLD = 2000  # S波速度阈值
-RATIO_THRESHOLD = 1.65  # Vp/Vs比值阈值
-VP_CHANGE_THRESHOLD = 30  # P波变化率阈值
-VS_CHANGE_THRESHOLD = 20  # S波变化率阈值
+VP_THRESHOLD = 3500  
+VS_THRESHOLD = 2000  
+RATIO_THRESHOLD = 1.65  
+VP_CHANGE_THRESHOLD = 30  
+VS_CHANGE_THRESHOLD = 20  
+
+# 数据增强
+class SeismicDataAugmentation:
+    def __init__(self, scale_range=(0.95, 1.05), noise_std=0.01, shift_range=0.1, mixup_alpha=0.2):
+        """
+        初始化数据增强模块。
+
+        参数:
+            scale_range (tuple): 随机缩放的范围，默认 (0.95, 1.05)。
+            noise_std (float): 高斯噪声的标准差，默认 0.01。
+            shift_range (float): 随机平移的比例，默认 0.1。
+            mixup_alpha (float): Mixup 的 alpha 参数，默认 0.2。
+        """
+        self.scale_range = scale_range
+        self.noise_std = noise_std
+        self.shift_range = shift_range
+        self.mixup_alpha = mixup_alpha
+
+    def random_scale(self, data):
+        """对数据的每个特征进行随机缩放"""
+        scale_factors = np.random.uniform(self.scale_range[0], self.scale_range[1], size=data.shape[1])  # [^1]
+        return data * scale_factors
+
+    def add_noise(self, data):
+        """高斯噪声"""
+        noise = np.random.normal(0, self.noise_std, data.shape)  # [^1]
+        return data + noise
+
+    def time_shift(self, data, seq_len):
+        """对序列数据进行随机平移（零填充）"""
+        shift = int(random.uniform(-self.shift_range, self.shift_range) * seq_len)  # [^1]
+        if shift > 0:
+            shifted_data = np.pad(data, ((shift, 0), (0, 0)), mode='constant')[:seq_len]
+        elif shift < 0:
+            shifted_data = np.pad(data, ((0, -shift), (0, 0)), mode='constant')[-seq_len:]
+        else:
+            shifted_data = data
+        return shifted_data
+
+    def mixup(self, data1, label1, data2, label2):
+        """Mixup 数据增强"""
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)  # [^1]
+        mixed_data = lam * data1 + (1 - lam) * data2
+        mixed_label = lam * label1 + (1 - lam) * label2
+        return mixed_data, mixed_label
+
+    def __call__(self, data, label, seq_len):
+        """应用数据增强（不含 Mixup，Mixup 在批处理时单独应用）"""
+        data = self.random_scale(data)
+        data = self.add_noise(data)
+        if seq_len > 1:  # 如果是序列数据，应用时间平移
+            data = self.time_shift(data, seq_len)
+        return data, label
 
 
 def create_directories():
@@ -210,12 +264,14 @@ def create_stratified_indices(supervised_data):
     return list(train_idx), list(val_idx), list(test_idx)
 
 
-# 定义监督学习时间序列数据集
+# 定义监督学习时间序列数据集 (整合数据增强)
 class SupervisedTimeseriesDataset(Dataset):
-    def __init__(self, dataset, target_col='class', lag=30):
+    def __init__(self, dataset, target_col='class', lag=30, train=True, augmentor=None):  # [^2]
         super(SupervisedTimeseriesDataset, self).__init__()
         self.target_col = target_col
         self.set = SupervisedTimeseriesData(dataset=dataset, lag=lag)
+        self.train = train  # [^2]
+        self.augmentor = augmentor if train else None  # 只在训练时使用增强
 
         if target_col == 'class':
             self.dataset = TensorDataset(
@@ -246,7 +302,12 @@ class SupervisedTimeseriesDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self.dataset[idx]
+        data, label = self.dataset[idx]
+        if self.augmentor:  # 应用数据增强 (非 Mixup) [^2]
+            data, label = self.augmentor(data.numpy(), label.numpy(), seq_len=data.shape[0])
+            data = torch.tensor(data, dtype=torch.float32)  # 转换回张量
+
+        return data, label
 
 
 # 分类模型结构
@@ -316,8 +377,8 @@ class ClassificationBiLSTMTransformer(nn.Module):
             raise ValueError(f"Unknown target: {target}")
 
 
-# 训练函数
-def train(model, iterator, optimizer, criterion, target_col='class',device=device):
+# 训练函数 (整合 Mixup)
+def train(model, iterator, optimizer, criterion, target_col='class', device=device, augmentor=None):  # [^3]
     model.train()
     epoch_loss = 0
 
@@ -327,8 +388,20 @@ def train(model, iterator, optimizer, criterion, target_col='class',device=devic
         total = 0
 
     for batch_idx, (data, target) in enumerate(iterable=iterator):
-        # 统一设备
-        data, target = data.to(device), target.to(device)
+
+        # Mixup (仅对分类任务且在训练时应用) [^3]
+        if target_col == 'class' and augmentor is not None:
+            data_np = data.numpy()
+            target_np = target.numpy()
+            batch_size = data.shape[0]
+            indices = np.random.permutation(batch_size)
+            mixed_data, mixed_target = augmentor.mixup(data_np, target_np, data_np[indices], target_np[indices])
+            data = torch.tensor(mixed_data, dtype=torch.float32).to(device)
+            target = torch.tensor(mixed_target, dtype=torch.long).to(device)  # 假设分类标签是整数类型
+
+        else:
+             data, target = data.to(device), target.to(device)
+
         optimizer.zero_grad()
         output = model(data, target=target_col)
 
@@ -342,6 +415,7 @@ def train(model, iterator, optimizer, criterion, target_col='class',device=devic
         else:
             loss = criterion(output, target)
 
+
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
@@ -351,6 +425,7 @@ def train(model, iterator, optimizer, criterion, target_col='class',device=devic
         return epoch_loss / len(iterator), accuracy
     else:
         return epoch_loss / len(iterator)
+
 
 
 # 评估函数
@@ -488,12 +563,14 @@ def main():
     # 准备数据集
     lag = 30  # 使用前30个时间步预测
     target_cols = ['Vp', 'Vs', 'Ratio', 'class']
-    dataset = SupervisedTimeseriesDataset(df, target_col='class', lag=lag)
-
+    # 创建数据增强器
+    augmentor = SeismicDataAugmentation()  # [^2]
+    dataset = SupervisedTimeseriesDataset(df, target_col='class', lag=lag, train=True, augmentor=augmentor)  # 训练集 [^2]
+    val_dataset = SupervisedTimeseriesDataset(df, target_col='class', lag=lag, train=False)   # 验证集
     # 创建数据加载器
     batch_size = 64
     train_loader = DataLoader(dataset=dataset.train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(dataset=dataset.val_set, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(dataset=val_dataset.val_set, batch_size=batch_size, shuffle=False) #验证集不需要增强
 
     # 创建模型
     params = {
@@ -522,13 +599,13 @@ def main():
     best_val_losses = {col: float('inf') for col in target_cols}
     best_accuracy = 0
 
-    epochs = 125
+    epochs = 300
     for epoch in range(epochs):
         print(f"\nEpoch {epoch + 1}/{epochs}")
 
         # 首先训练分类任务
         train_loss, train_acc = train(model, train_loader, optimizer, classification_criterion, target_col='class',
-                                      device=device)
+                                      device=device, augmentor=augmentor)  # 传入 augmentor [^3]
         val_loss, val_acc, val_preds, val_targets = evaluate(model, val_loader, classification_criterion,
                                                              target_col='class', device=device)
 
@@ -547,14 +624,15 @@ def main():
         # 训练回归任务（可选，多任务学习）
         for col in ['Vp', 'Vs', 'Ratio']:
             # 为当前任务创建数据加载器
-            regression_dataset = SupervisedTimeseriesDataset(df, target_col=col, lag=lag)
+            regression_dataset = SupervisedTimeseriesDataset(df, target_col=col, lag=lag, train=True, augmentor=augmentor) #训练集
+            regression_val_dataset = SupervisedTimeseriesDataset(df, target_col=col, lag=lag, train=False) #验证集
             regression_train_loader = DataLoader(dataset=regression_dataset.train_set, batch_size=batch_size,
                                                  shuffle=True)
-            regression_val_loader = DataLoader(dataset=regression_dataset.val_set, batch_size=batch_size, shuffle=False)
+            regression_val_loader = DataLoader(dataset=regression_val_dataset.val_set, batch_size=batch_size, shuffle=False) #验证集不需要增强
 
             # 训练回归任务
             train_loss = train(model, regression_train_loader, optimizer, regression_criterion, target_col=col,
-                               device=device)
+                               device=device, augmentor=augmentor) #回归任务不需要mixup
             val_loss = evaluate(model, regression_val_loader, regression_criterion, target_col=col, device=device)
 
             train_losses[col].append(train_loss)
